@@ -408,6 +408,7 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   no_sync_func: Optional[Callable] = None,
                                                   grad_sync_func: Optional[Callable] = None,
                                                   param_sync_func: Optional[Callable] = None,
+                                                  pipeline_schedule: str = 'bfs',
                                                   ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -460,7 +461,7 @@ def forward_backward_pipelining_with_interleaving(*,
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
 
-    if num_microbatches % pipeline_parallel_size != 0:
+    if pipeline_schedule != 'bfs' and num_microbatches % pipeline_parallel_size != 0:
         msg = f'number of microbatches ({num_microbatches}) is not divisible by '
         msg += f'pipeline-model-parallel-size ({pipeline_parallel_size}) '
         msg += 'when using interleaved schedule'
@@ -494,7 +495,7 @@ def forward_backward_pipelining_with_interleaving(*,
         # all workers, followed by more microbatches after depending on
         # stage ID (more forward passes for earlier stages, later stages can
         # immediately start with 1F1B).
-        if num_microbatches == pipeline_parallel_size:
+        if num_microbatches == pipeline_parallel_size or pipeline_schedule == 'bfs':
             num_warmup_microbatches = total_num_microbatches
             all_warmup_microbatches = True
         else:
@@ -514,33 +515,44 @@ def forward_backward_pipelining_with_interleaving(*,
 
     def get_model_chunk_id(microbatch_id, forward):
         """Helper method to get the model chunk ID given the iteration number."""
-        microbatch_id_in_group = microbatch_id % (pipeline_parallel_size * num_model_chunks)
-        model_chunk_id = microbatch_id_in_group // pipeline_parallel_size
-        if not forward:
-            model_chunk_id = (num_model_chunks - model_chunk_id - 1)
+        if pipeline_schedule == 'bfs':
+            microbatch_id_in_group = microbatch_id % (num_microbatches * num_model_chunks)
+            model_chunk_id = microbatch_id_in_group // num_microbatches
+            if not forward:
+                model_chunk_id = (num_model_chunks - model_chunk_id - 1)
+        else:
+            microbatch_id_in_group = microbatch_id % (pipeline_parallel_size * num_model_chunks)
+            model_chunk_id = microbatch_id_in_group // pipeline_parallel_size
+            if not forward:
+                model_chunk_id = (num_model_chunks - model_chunk_id - 1)
         return model_chunk_id
 
     def is_first_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the first for a model chunk."""
-        microbatch_group_size = pipeline_parallel_size * num_model_chunks
-        num_microbatch_groups = total_num_microbatches // microbatch_group_size
-        microbatch_group_id = microbatch_id // microbatch_group_size
-        microbatch_id_in_group = microbatch_id % microbatch_group_size
-        if microbatch_group_id == 0:
-            return microbatch_id_in_group % pipeline_parallel_size == 0
+        if pipeline_schedule == 'bfs':
+            return microbatch_id % num_microbatches == 0
         else:
-            return False
+            microbatch_group_size = pipeline_parallel_size * num_model_chunks
+            microbatch_group_id = microbatch_id // microbatch_group_size
+            microbatch_id_in_group = microbatch_id % microbatch_group_size
+            if microbatch_group_id == 0:
+                return microbatch_id_in_group % pipeline_parallel_size == 0
+            else:
+                return False
 
     def is_last_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the last for a model chunk."""
-        microbatch_group_size = pipeline_parallel_size * num_model_chunks
-        num_microbatch_groups = total_num_microbatches // microbatch_group_size
-        microbatch_group_id = microbatch_id // microbatch_group_size
-        microbatch_id_in_group = microbatch_id % microbatch_group_size
-        if microbatch_group_id == num_microbatch_groups - 1:
-            return microbatch_id_in_group % pipeline_parallel_size == pipeline_parallel_size - 1
+        if pipeline_schedule == 'bfs':
+            return microbatch_id % num_microbatches == num_microbatches - 1
         else:
-            return False
+            microbatch_group_size = pipeline_parallel_size * num_model_chunks
+            num_microbatch_groups = total_num_microbatches // microbatch_group_size
+            microbatch_group_id = microbatch_id // microbatch_group_size
+            microbatch_id_in_group = microbatch_id % microbatch_group_size
+            if microbatch_group_id == num_microbatch_groups - 1:
+                return microbatch_id_in_group % pipeline_parallel_size == pipeline_parallel_size - 1
+            else:
+                return False
 
 
     def forward_step_helper(microbatch_id):
